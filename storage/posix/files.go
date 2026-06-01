@@ -143,9 +143,11 @@ func (s *Storage) newAppender(ctx context.Context, o *logResourceStorage, opts *
 	if err := a.initialise(ctx); err != nil {
 		return nil, nil, err
 	}
-	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(), a.sequenceBatch)
+	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(),
+		func(fn func(context.Context)) { opts.RunInBackground(ctx, fn) }, a.sequenceBatch)
 
-	go func(ctx context.Context, i time.Duration) {
+	opts.RunInBackground(ctx, func(ctx context.Context) {
+		i := opts.CheckpointInterval()
 		for {
 			select {
 			case <-ctx.Done():
@@ -157,9 +159,9 @@ func (s *Storage) newAppender(ctx context.Context, o *logResourceStorage, opts *
 				klog.Warningf("publishCheckpoint: %v", err)
 			}
 		}
-	}(ctx, opts.CheckpointInterval())
+	})
 	if i := opts.GarbageCollectionInterval(); i > 0 {
-		go a.garbageCollectorJob(ctx, i)
+		opts.RunInBackground(ctx, func(ctx context.Context) { a.garbageCollectorJob(ctx, i) })
 	}
 
 	return a, a.logStorage, nil

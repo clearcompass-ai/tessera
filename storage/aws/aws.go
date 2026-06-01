@@ -225,9 +225,10 @@ func (s *Storage) newAppender(ctx context.Context, o objStore, seq sequencer, op
 	}
 
 	r := &Appender{
-		logStore:    logStore,
-		sequencer:   seq,
-		queue:       storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(), seq.assignEntries),
+		logStore:  logStore,
+		sequencer: seq,
+		queue: storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(),
+			func(fn func(context.Context)) { opts.RunInBackground(ctx, fn) }, seq.assignEntries),
 		newCP:       opts.CheckpointPublisher(logStore, s.cfg.HTTPClient),
 		treeUpdated: make(chan struct{}),
 	}
@@ -237,13 +238,15 @@ func (s *Storage) newAppender(ctx context.Context, o objStore, seq sequencer, op
 	}
 
 	// Kick off go-routine which handles the integration of entries.
-	go r.integrateEntriesJob(ctx)
+	opts.RunInBackground(ctx, r.integrateEntriesJob)
 
 	// Kick off go-routine which handles the publication of checkpoints.
-	go r.publishCheckpointJob(ctx, opts.CheckpointInterval(), opts.CheckpointRepublishInterval())
+	opts.RunInBackground(ctx, func(ctx context.Context) {
+		r.publishCheckpointJob(ctx, opts.CheckpointInterval(), opts.CheckpointRepublishInterval())
+	})
 
 	if i := opts.GarbageCollectionInterval(); i > 0 {
-		go r.garbageCollectorJob(ctx, i)
+		opts.RunInBackground(ctx, func(ctx context.Context) { r.garbageCollectorJob(ctx, i) })
 	}
 
 	return r, r.logStore, nil

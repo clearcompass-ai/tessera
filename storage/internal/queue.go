@@ -48,12 +48,28 @@ type Queue struct {
 // See the comment on Entry.MarshalBundleData for further info.
 type FlushFunc func(ctx context.Context, entries []*tessera.Entry) error
 
+// SpawnFunc starts a background goroutine.
+//
+// It is used to integrate the Queue's worker goroutine into an Appender's
+// lifecycle so that it can be stopped and awaited deterministically (see
+// tessera.AppendOptions.RunInBackground). A nil SpawnFunc causes NewQueue to
+// start the worker with a bare `go` bound to the context passed to NewQueue,
+// which matches the historical behaviour and is convenient for unit tests that
+// construct a Queue directly.
+type SpawnFunc func(func(context.Context))
+
 // NewQueue creates a new queue with the specified maximum age and size.
 //
 // The provided FlushFunc will be called with a slice containing the contents of the queue, in
 // the same order as they were added, when either the oldest entry in the queue has been there
 // for maxAge, or the size of the queue reaches maxSize.
-func NewQueue(ctx context.Context, maxAge time.Duration, maxSize uint, f FlushFunc) *Queue {
+//
+// The worker goroutine which performs flushes is started via spawn so that its
+// lifetime is owned by the Appender (see SpawnFunc). When the worker's context is
+// cancelled it resolves any not-yet-flushed entries with that context's error,
+// guaranteeing that every IndexFuture returned by Add eventually resolves rather
+// than blocking forever.
+func NewQueue(ctx context.Context, maxAge time.Duration, maxSize uint, spawn SpawnFunc, f FlushFunc) *Queue {
 	q := &Queue{
 		maxSize: maxSize,
 		maxAge:  maxAge,
@@ -61,17 +77,25 @@ func NewQueue(ctx context.Context, maxAge time.Duration, maxSize uint, f FlushFu
 		items:   make([]queueItem, 0, maxSize),
 	}
 
-	// Spin off a worker thread to write the queue flushes to storage.
-	go func(ctx context.Context) {
+	// The worker reads flushes off q.work and writes them to storage. On context
+	// cancellation it fails any entries which haven't been flushed so their futures
+	// resolve with an error instead of hanging.
+	worker := func(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				q.failPending(ctx.Err())
 				return
 			case entries := <-q.work:
 				q.doFlush(ctx, f, entries)
 			}
 		}
-	}(ctx)
+	}
+	if spawn != nil {
+		spawn(worker)
+	} else {
+		go worker(ctx)
+	}
 	return q
 }
 
@@ -146,6 +170,34 @@ func (q *Queue) doFlush(ctx context.Context, f FlushFunc, entries []queueItem) {
 	// Send assigned indices to all the waiting Add() requests
 	for _, e := range entries {
 		e.notify(err)
+	}
+}
+
+// failPending resolves every entry which has been queued but not yet flushed —
+// both the current in-memory batch and any batch already handed to the worker —
+// with the provided error. This releases callers blocked in their IndexFuture
+// instead of leaving them to wait forever once the worker has stopped. It is
+// called by the worker when its context is cancelled.
+//
+// Resolving an entry's result is idempotent (the underlying future uses
+// sync.Once), so racing with a concurrent flush is safe: whichever runs first
+// wins and the other is a no-op.
+func (q *Queue) failPending(err error) {
+	q.mu.Lock()
+	pending := q.flushLocked()
+	q.mu.Unlock()
+
+	// Also drain any batch already handed to the worker but not yet processed.
+	for {
+		select {
+		case items := <-q.work:
+			pending = append(pending, items...)
+		default:
+			for _, e := range pending {
+				e.notify(err)
+			}
+			return
+		}
 	}
 }
 

@@ -72,7 +72,7 @@ func TestQueue(t *testing.T) {
 			}
 
 			// Create the Queue
-			q := storage.NewQueue(ctx, test.maxWait, uint(test.maxEntries), flushFunc)
+			q := storage.NewQueue(ctx, test.maxWait, uint(test.maxEntries), nil, flushFunc)
 
 			// Now submit a bunch of entries
 			adds := make([]tessera.IndexFuture, test.numItems)
@@ -137,7 +137,7 @@ func TestNotify(t *testing.T) {
 			}
 
 			// Create the Queue
-			q := storage.NewQueue(ctx, time.Second, uint(1), flushFunc)
+			q := storage.NewQueue(ctx, time.Second, uint(1), nil, flushFunc)
 
 			// Now submit the entry
 			added := q.Add(ctx, tessera.NewEntry([]byte(test.name)))
@@ -160,7 +160,7 @@ func BenchmarkQueue(b *testing.B) {
 			}
 			return nil
 		}
-		q := storage.NewQueue(ctx, time.Second, 256, flushFn)
+		q := storage.NewQueue(ctx, time.Second, 256, nil, flushFn)
 
 		adds := make([]tessera.IndexFuture, 0, count)
 		for leafIndex := range count {

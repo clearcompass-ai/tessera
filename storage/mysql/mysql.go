@@ -91,14 +91,16 @@ func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*t
 		newCheckpoint: opts.CheckpointPublisher(s, http.DefaultClient),
 		cpUpdated:     make(chan struct{}, 1),
 	}
-	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(), a.sequenceBatch)
+	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(),
+		func(fn func(context.Context)) { opts.RunInBackground(ctx, fn) }, a.sequenceBatch)
 
 	if err := s.maybeInitTree(ctx); err != nil {
 		return nil, nil, fmt.Errorf("maybeInitTree: %v", err)
 	}
 	a.cpUpdated <- struct{}{}
 
-	go func(ctx context.Context, i time.Duration) {
+	opts.RunInBackground(ctx, func(ctx context.Context) {
+		i := opts.CheckpointInterval()
 		t := time.NewTicker(i)
 		defer t.Stop()
 		for {
@@ -112,7 +114,7 @@ func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*t
 				klog.Warningf("publishCheckpoint: %v", err)
 			}
 		}
-	}(ctx, opts.CheckpointInterval())
+	})
 
 	return &tessera.Appender{
 		Add: a.Add,
