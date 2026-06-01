@@ -257,7 +257,8 @@ func (s *Storage) newAppender(ctx context.Context, o objStore, seq *spannerCoord
 		sequencer: seq,
 		cpUpdated: make(chan struct{}),
 	}
-	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(), a.sequencer.assignEntries)
+	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(),
+		func(fn func(context.Context)) { opts.RunInBackground(ctx, fn) }, a.sequencer.assignEntries)
 
 	reader := &LogReader{
 		lrs: *a.logStore,
@@ -275,10 +276,12 @@ func (s *Storage) newAppender(ctx context.Context, o objStore, seq *spannerCoord
 		return nil, nil, fmt.Errorf("failed to initialise log storage: %v", err)
 	}
 
-	go a.integrateEntriesJob(ctx)
-	go a.publishCheckpointJob(ctx, opts.CheckpointInterval(), opts.CheckpointRepublishInterval())
+	opts.RunInBackground(ctx, a.integrateEntriesJob)
+	opts.RunInBackground(ctx, func(ctx context.Context) {
+		a.publishCheckpointJob(ctx, opts.CheckpointInterval(), opts.CheckpointRepublishInterval())
+	})
 	if i := opts.GarbageCollectionInterval(); i > 0 {
-		go a.garbageCollectorJob(ctx, i)
+		opts.RunInBackground(ctx, func(ctx context.Context) { a.garbageCollectorJob(ctx, i) })
 	}
 
 	return a, reader, nil

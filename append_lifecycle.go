@@ -229,10 +229,23 @@ type Index struct {
 }
 
 // Appender allows personalities access to the lifecycle methods associated with logs
-// in sequencing mode. This only has a single method, but other methods are likely to be added
-// such as a Shutdown method for #341.
+// in sequencing mode.
+//
+// In addition to Add, it provides Shutdown (see shutdown.go) which performs a
+// deterministic drain-and-join shutdown of the Appender. Shutdown is the
+// "Shutdown method for #341" anticipated by earlier revisions of this comment.
 type Appender struct {
 	Add AddFn
+
+	// drain refuses further Adds and blocks until a published checkpoint commits
+	// to every index this Appender has issued. It is the same function returned as
+	// the second result of NewAppender (terminator.Shutdown), and is populated by
+	// NewAppender. It may be nil if the Appender was not built via NewAppender.
+	drain func(ctx context.Context) error
+	// lc owns the background goroutines started for this Appender (both here and in
+	// the storage driver) so that Shutdown can stop and await them. Populated by
+	// NewAppender; nil if the Appender was not built via NewAppender.
+	lc *goGroup
 }
 
 // NewAppender returns an Appender, which allows a personality to incrementally append new
@@ -265,6 +278,11 @@ func NewAppender(ctx context.Context, d Driver, opts *AppendOptions) (*Appender,
 	if err := opts.valid(); err != nil {
 		return nil, nil, nil, err
 	}
+	// Install a lifecycle group so that all background goroutines started below —
+	// both here and inside the storage driver's Appender — are tracked and can be
+	// deterministically stopped and awaited by Appender.Shutdown.
+	opts.lc = newGoGroup(ctx)
+
 	a, r, err := lc.Appender(ctx, opts)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to init appender lifecycle: %v", err)
@@ -276,10 +294,10 @@ func NewAppender(ctx context.Context, d Driver, opts *AppendOptions) (*Appender,
 	sd := &integrationStats{}
 	a.Add = sd.statsDecorator(a.Add)
 	for _, f := range opts.followers {
-		go f.Follow(ctx, r)
-		go followerStats(ctx, f, r.IntegratedSize)
+		opts.RunInBackground(ctx, func(ctx context.Context) { f.Follow(ctx, r) })
+		opts.RunInBackground(ctx, func(ctx context.Context) { followerStats(ctx, f, r.IntegratedSize) })
 	}
-	go sd.updateStats(ctx, r)
+	opts.RunInBackground(ctx, func(ctx context.Context) { sd.updateStats(ctx, r) })
 	t := terminator{
 		delegate:       a.Add,
 		readCheckpoint: r.ReadCheckpoint,
@@ -300,6 +318,11 @@ func NewAppender(ctx context.Context, d Driver, opts *AppendOptions) (*Appender,
 		//		 this remains true.
 		return memoizeFuture(t.Add(ctx, entry))
 	}
+	// Wire up Appender.Shutdown: drain in-flight Adds, then stop and join the
+	// lifecycle goroutines. The drain function is also returned (unchanged) as the
+	// second result for callers that don't use Shutdown.
+	a.drain = t.Shutdown
+	a.lc = opts.lc
 	return a, t.Shutdown, r, nil
 }
 
@@ -606,6 +629,36 @@ type AppendOptions struct {
 
 	// garbageCollectionInterval of zero should be interpreted as requesting garbage collection to be disabled.
 	garbageCollectionInterval time.Duration
+
+	// lc owns the background goroutines started during NewAppender and the storage
+	// driver's Appender, so that Appender.Shutdown can stop and await them. It is
+	// set by NewAppender and is nil when a storage implementation is constructed
+	// directly (e.g. in storage-level unit tests), in which case RunInBackground
+	// falls back to an untracked goroutine.
+	lc *goGroup
+}
+
+// RunInBackground starts fn as a background goroutine that forms part of the
+// Appender's lifecycle.
+//
+// Storage implementations MUST use this in place of a bare `go` statement for
+// their long-running loops (checkpoint publication, integration, garbage
+// collection, ...). When the Appender is constructed via NewAppender, fn is
+// tracked: Appender.Shutdown will signal it to stop (by cancelling the context it
+// is passed) and will block until it returns. fn should therefore return promptly
+// once its context is cancelled.
+//
+// When no lifecycle is installed — i.e. the storage implementation was built
+// directly rather than through NewAppender, as some storage-level unit tests do —
+// fn runs as an untracked goroutine bound to ctx, matching historical behaviour.
+// In that case the ctx argument is what governs the goroutine's lifetime;
+// otherwise ctx is unused and the lifecycle's context is used instead.
+func (o *AppendOptions) RunInBackground(ctx context.Context, fn func(context.Context)) {
+	if o.lc != nil {
+		o.lc.Go(fn)
+		return
+	}
+	go fn(ctx)
 }
 
 // valid returns an error if an invalid combination of options has been set, or nil otherwise.
